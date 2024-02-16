@@ -60,12 +60,12 @@ local Dig = function () -- yes Dig my ass out pls mmm daddy
 end
 
 local Fluent = loadstring(game:HttpGet("https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua"))()
-local SaveManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/babadz207/pet99/main/save"))()
+local SaveManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/SaveManager.lua"))()
 local InterfaceManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/InterfaceManager.lua"))()
 
 local Window = Fluent:CreateWindow({
     Title = "BABA PS99",
-    SubTitle = "by Baba",
+    SubTitle = "khoadz",
     TabWidth = 160,
     Size = UDim2.fromOffset(580, 460),
     Acrylic = false, -- The blur may be detectable, setting this to false disables blur entirely
@@ -122,8 +122,8 @@ SaveManager:SetLibrary(Fluent)
 InterfaceManager:SetLibrary(Fluent)
 SaveManager:IgnoreThemeSettings()
 SaveManager:SetIgnoreIndexes({})
-InterfaceManager:SetFolder("BabaHub")
-SaveManager:SetFolder("BABAHUB/PS99")
+InterfaceManager:SetFolder("AniHub")
+SaveManager:SetFolder("AniHub/specific-game")
 
 InterfaceManager:BuildInterfaceSection(Tabs.Digging)
 SaveManager:BuildConfigSection(Tabs.Digging)
