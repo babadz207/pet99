@@ -1,0 +1,7 @@
+getgenv().sh = true
+
+while getgenv().sh do wait(420)
+
+  game:GetService("TeleportService"):Teleport(8737899170,game.Players.LocalPlayer)
+
+end
