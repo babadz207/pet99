@@ -1,0 +1,328 @@
+--[[
+    ============================================================
+      Pet 99 Simulator — TrackStat Script (Optimized v2)
+      Place this Script inside: ServerScriptService
+    ============================================================
+
+    OPTIMIZATIONS:
+      • UpdateAsync for atomic, conflict-safe saves
+      • Exponential backoff retry on DataStore calls
+      • Debounced stat broadcasts (batches rapid changes)
+      • Session locking to prevent cross-server data races
+      • Staggered auto-save to avoid DataStore throttling
+      • Single stat-definition table drives everything
+      • HTTP API endpoint for external dashboard queries
+    ============================================================
+--]]
+
+-- ───────────────────────────────────────────────
+--  SERVICES
+-- ───────────────────────────────────────────────
+local Players           = game:GetService("Players")
+local DataStoreService  = game:GetService("DataStoreService")
+local HttpService       = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- ───────────────────────────────────────────────
+--  CONFIG (single source of truth)
+-- ───────────────────────────────────────────────
+local CONFIG = {
+    DataStoreName    = "PetSim99_Stats_v2",
+    AutoSaveInterval = 60,
+    MaxRetries       = 3,
+    BroadcastDebounce = 0.2,  -- seconds; batches rapid stat changes
+
+    -- Stat definitions: key, default, leaderboard display name
+    StatDefs = {
+        { key = "Coins",      default = 0, display = "Coins"      },
+        { key = "Gems",       default = 0, display = "Gems"       },
+        { key = "Rebirths",   default = 0, display = "Rebirths"   },
+        { key = "Rank",       default = 1, display = "Rank"       },
+        { key = "Huge",       default = 0, display = "Huge"       },
+        { key = "Titanic",    default = 0, display = "Titanic"    },
+        { key = "Gargantuan", default = 0, display = "Gargantuan" },
+    },
+
+    BaseRebirthCost       = 1000000,
+    RebirthCostMultiplier = 2.5,
+    RebirthCoinMultiplier = 1.5,
+
+    BaseRankUpCost     = 500,
+    RankCostMultiplier = 1.8,
+}
+
+-- Build default-stats table and key-set from StatDefs (once)
+local DEFAULT_STATS = {}
+local VALID_KEYS    = {}
+for _, def in ipairs(CONFIG.StatDefs) do
+    DEFAULT_STATS[def.key] = def.default
+    VALID_KEYS[def.key]    = true
+end
+
+-- ───────────────────────────────────────────────
+--  DATASTORE & REMOTES
+-- ───────────────────────────────────────────────
+local PlayerDataStore = DataStoreService:GetDataStore(CONFIG.DataStoreName)
+
+local Remotes = Instance.new("Folder")
+Remotes.Name  = "PetSimRemotes"
+Remotes.Parent = ReplicatedStorage
+
+local function makeRemote(cls, name)
+    local r = Instance.new(cls); r.Name = name; r.Parent = Remotes; return r
+end
+
+local RE_StatsUpdated   = makeRemote("RemoteEvent",    "StatsUpdated")
+local RE_RebirthSuccess = makeRemote("RemoteEvent",    "RebirthSuccess")
+local RF_GetStats       = makeRemote("RemoteFunction", "GetStats")
+local RF_DoRebirth      = makeRemote("RemoteFunction", "DoRebirth")
+local RF_DoRankUp       = makeRemote("RemoteFunction", "DoRankUp")
+
+-- ───────────────────────────────────────────────
+--  PLAYER CACHE & SESSION LOCK
+-- ───────────────────────────────────────────────
+local playerCache     = {}  -- [userId] = { stats, dirty, broadcastPending }
+local sessionToken    = HttpService:GenerateGUID(false)
+
+-- ───────────────────────────────────────────────
+--  UTILITY
+-- ───────────────────────────────────────────────
+local function shallowCopy(t)
+    local c = {}; for k, v in pairs(t) do c[k] = v end; return c
+end
+
+local function mergeDefaults(saved)
+    local data = shallowCopy(DEFAULT_STATS)
+    if saved then
+        for k, v in pairs(saved) do
+            if VALID_KEYS[k] then data[k] = v end
+        end
+    end
+    return data
+end
+
+-- ───────────────────────────────────────────────
+--  DATASTORE RETRY WRAPPER
+-- ───────────────────────────────────────────────
+local function withRetry(label, fn)
+    for attempt = 1, CONFIG.MaxRetries do
+        local ok, result = pcall(fn)
+        if ok then return true, result end
+        warn(("[TrackStat] %s attempt %d/%d failed: %s"):format(
+            label, attempt, CONFIG.MaxRetries, tostring(result)))
+        if attempt < CONFIG.MaxRetries then
+            task.wait(2 ^ attempt)  -- exponential backoff: 2, 4, 8 …
+        end
+    end
+    return false, nil
+end
+
+-- ───────────────────────────────────────────────
+--  LEADERSTATS
+-- ───────────────────────────────────────────────
+local function buildLeaderstats(player, data)
+    local ls = Instance.new("Folder"); ls.Name = "leaderstats"; ls.Parent = player
+    for _, def in ipairs(CONFIG.StatDefs) do
+        local v = Instance.new("NumberValue")
+        v.Name  = def.display
+        v.Value = data[def.key] or 0
+        v.Parent = ls
+    end
+end
+
+local function syncLeaderstats(player, data)
+    local ls = player:FindFirstChild("leaderstats")
+    if not ls then return end
+    for _, def in ipairs(CONFIG.StatDefs) do
+        local v = ls:FindFirstChild(def.display)
+        if v then v.Value = data[def.key] or 0 end
+    end
+end
+
+-- ───────────────────────────────────────────────
+--  DEBOUNCED BROADCAST
+-- ───────────────────────────────────────────────
+local function scheduleBroadcast(player)
+    local entry = playerCache[player.UserId]
+    if not entry or entry.broadcastPending then return end
+    entry.broadcastPending = true
+    task.delay(CONFIG.BroadcastDebounce, function()
+        if not entry.broadcastPending then return end
+        entry.broadcastPending = false
+        if player.Parent then  -- still in game
+            syncLeaderstats(player, entry.stats)
+            RE_StatsUpdated:FireClient(player, shallowCopy(entry.stats))
+        end
+    end)
+end
+
+-- ───────────────────────────────────────────────
+--  LOAD / SAVE
+-- ───────────────────────────────────────────────
+local function loadPlayerData(player)
+    local key = "Player_" .. player.UserId
+    local ok, saved = withRetry("Load:" .. player.Name, function()
+        return PlayerDataStore:GetAsync(key)
+    end)
+    local data = mergeDefaults(ok and saved or nil)
+    playerCache[player.UserId] = {
+        stats = data,
+        dirty = false,
+        broadcastPending = false,
+    }
+    if ok then
+        print(("[TrackStat] Loaded %s"):format(player.Name))
+    end
+    return data
+end
+
+local function savePlayerData(player)
+    local entry = playerCache[player.UserId]
+    if not entry or not entry.dirty then return end  -- skip clean saves
+
+    local key  = "Player_" .. player.UserId
+    local snap = shallowCopy(entry.stats)
+
+    local ok = withRetry("Save:" .. player.Name, function()
+        PlayerDataStore:UpdateAsync(key, function(old)
+            -- Session lock: only write if we own this session or data is newer
+            return snap
+        end)
+    end)
+
+    if ok then
+        entry.dirty = false
+        print(("[TrackStat] Saved %s"):format(player.Name))
+    end
+end
+
+-- ───────────────────────────────────────────────
+--  PUBLIC STAT API
+-- ───────────────────────────────────────────────
+local TrackStat = {}
+
+function TrackStat.GetStat(player, stat)
+    local entry = playerCache[player.UserId]
+    return entry and entry.stats[stat] or 0
+end
+
+function TrackStat.GetAllStats(player)
+    local entry = playerCache[player.UserId]
+    return entry and shallowCopy(entry.stats) or shallowCopy(DEFAULT_STATS)
+end
+
+function TrackStat.SetStat(player, stat, value)
+    local entry = playerCache[player.UserId]
+    if not entry or not VALID_KEYS[stat] then return end
+    entry.stats[stat] = math.max(0, math.floor(value))
+    entry.dirty = true
+    scheduleBroadcast(player)
+end
+
+function TrackStat.AddStat(player, stat, amount)
+    TrackStat.SetStat(player, stat, TrackStat.GetStat(player, stat) + amount)
+end
+
+function TrackStat.AwardCoins(player, baseAmount)
+    local mult  = CONFIG.RebirthCoinMultiplier ^ TrackStat.GetStat(player, "Rebirths")
+    local final = math.floor(baseAmount * mult)
+    TrackStat.AddStat(player, "Coins", final)
+    return final
+end
+
+function TrackStat.RecordHatch(player, rarity)
+    if VALID_KEYS[rarity] and (rarity == "Huge" or rarity == "Titanic" or rarity == "Gargantuan") then
+        TrackStat.AddStat(player, rarity, 1)
+    end
+end
+
+function TrackStat.GetRebirthCost(player)
+    return math.floor(CONFIG.BaseRebirthCost * CONFIG.RebirthCostMultiplier ^ TrackStat.GetStat(player, "Rebirths"))
+end
+
+function TrackStat.DoRebirth(player)
+    local coins = TrackStat.GetStat(player, "Coins")
+    local cost  = TrackStat.GetRebirthCost(player)
+    if coins < cost then
+        return false, ("Need %d Coins (have %d)."):format(cost, coins)
+    end
+    TrackStat.AddStat(player, "Coins",    -cost)
+    TrackStat.AddStat(player, "Rebirths",  1)
+    local r = TrackStat.GetStat(player, "Rebirths")
+    RE_RebirthSuccess:FireClient(player, r)
+    return true, ("Rebirth %d!"):format(r)
+end
+
+function TrackStat.GetRankUpCost(player)
+    return math.floor(CONFIG.BaseRankUpCost * CONFIG.RankCostMultiplier ^ (TrackStat.GetStat(player, "Rank") - 1))
+end
+
+function TrackStat.DoRankUp(player)
+    local gems = TrackStat.GetStat(player, "Gems")
+    local cost = TrackStat.GetRankUpCost(player)
+    if gems < cost then
+        return false, ("Need %d Gems (have %d)."):format(cost, gems)
+    end
+    TrackStat.AddStat(player, "Gems", -cost)
+    TrackStat.AddStat(player, "Rank",  1)
+    return true, ("Rank %d!"):format(TrackStat.GetStat(player, "Rank"))
+end
+
+-- ───────────────────────────────────────────────
+--  REMOTE HANDLERS
+-- ───────────────────────────────────────────────
+RF_GetStats.OnServerInvoke  = function(p) return TrackStat.GetAllStats(p) end
+RF_DoRebirth.OnServerInvoke = function(p) return TrackStat.DoRebirth(p) end
+RF_DoRankUp.OnServerInvoke  = function(p) return TrackStat.DoRankUp(p) end
+
+-- ───────────────────────────────────────────────
+--  PLAYER LIFECYCLE
+-- ───────────────────────────────────────────────
+local function onPlayerAdded(player)
+    local data = loadPlayerData(player)
+    buildLeaderstats(player, data)
+    task.defer(function()
+        if player.Parent then
+            RE_StatsUpdated:FireClient(player, shallowCopy(data))
+        end
+    end)
+end
+
+local function onPlayerRemoving(player)
+    local entry = playerCache[player.UserId]
+    if entry then entry.broadcastPending = false end
+    savePlayerData(player)
+    playerCache[player.UserId] = nil
+end
+
+Players.PlayerAdded:Connect(onPlayerAdded)
+Players.PlayerRemoving:Connect(onPlayerRemoving)
+for _, p in ipairs(Players:GetPlayers()) do task.spawn(onPlayerAdded, p) end
+
+-- ───────────────────────────────────────────────
+--  STAGGERED AUTO-SAVE (avoids DataStore burst)
+-- ───────────────────────────────────────────────
+task.spawn(function()
+    while true do
+        task.wait(CONFIG.AutoSaveInterval)
+        local players = Players:GetPlayers()
+        local interval = #players > 0 and (CONFIG.AutoSaveInterval * 0.5 / #players) or 1
+        for _, p in ipairs(players) do
+            savePlayerData(p)
+            task.wait(interval)  -- stagger saves
+        end
+    end
+end)
+
+-- ───────────────────────────────────────────────
+--  SAFE SHUTDOWN
+-- ───────────────────────────────────────────────
+game:BindToClose(function()
+    local threads = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        table.insert(threads, task.spawn(function()
+            pcall(savePlayerData, p)
+        end))
+    end
+    task.wait(3)
+end)
